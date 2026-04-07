@@ -12,8 +12,15 @@ from pathlib import Path
 
 from bot_worker import BotWorker
 from models import AccountConfig, AppSettings, BotEvent, BotSnapshot, apply_app_settings
+from browser_profile import generate_browser_profile, is_complete_browser_profile
 from registration import RegistrationResult, random_nickname, register_new_account_api_only
-from siege_client import get_bp_progress, get_inventory, get_player_progress, set_http_proxy
+from siege_client import (
+    get_bp_progress,
+    get_inventory,
+    get_player_progress,
+    set_http_proxy,
+    set_request_browser_profile,
+)
 from storage import (
     AccountManagerCacheStore,
     AccountStore,
@@ -26,7 +33,7 @@ from storage import (
 
 try:
     from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QBrush, QColor, QFont
     from PySide6.QtWidgets import (
         QApplication,
         QButtonGroup,
@@ -129,6 +136,11 @@ QFrame#accountCard {
     border: 1px solid #2d2d2d;
     border-radius: 14px;
 }
+QFrame#accountCard[accountBanned="true"] {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2c1618, stop:1 #1a0e10);
+    border: 2px solid #c63e3e;
+    border-radius: 14px;
+}
 QFrame#fleetShell {
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #161616, stop:1 #0e0e0e);
     border: 1px solid #2a2a2a;
@@ -155,7 +167,6 @@ QTableWidget {
     color: #eaeaea;
 }
 QTableWidget::item {
-    color: #eaeaea;
     padding: 4px 8px;
     border: none;
 }
@@ -248,6 +259,17 @@ QPushButton#secondary:hover {
     border: 1px solid #454545;
 }
 QPushButton#secondary:pressed { background-color: #121212; }
+QPushButton#danger {
+    color: #ffc8c4;
+    background-color: #3d1818;
+    border: 1px solid #7a2a2a;
+    border-radius: 9px;
+    padding: 11px 22px;
+    font-weight: 700;
+    font-size: 11px;
+}
+QPushButton#danger:hover { background-color: #4a2020; border-color: #933; }
+QPushButton#danger:pressed { background-color: #321414; }
 QPushButton#acctProxyBtn {
     background-color: #1f1f1f;
     color: #3fff8b;
@@ -523,10 +545,18 @@ def _wave_done_activity_text(payload: dict) -> str:
     )
 
 
-def _fetch_account_details_dict(acc: AccountConfig) -> dict:
+def _fetch_account_details_dict(acc: AccountConfig, *, account_banned: bool = False) -> dict:
     """Сетевые вызовы — только из фонового потока (не из GUI)."""
+    if account_banned:
+        return {"equip": "ACCOUNT_BANNED — опрос API отключён"}
     try:
         set_http_proxy(acc.http_proxy)
+        prof = (
+            acc.browser_profile
+            if is_complete_browser_profile(acc.browser_profile)
+            else generate_browser_profile()
+        )
+        set_request_browser_profile(prof)
         prog = get_player_progress(acc.bearer_token, acc.client_version)
         comp = prog.get("computed", {})
         inv = get_inventory(acc.bearer_token, acc.client_version)
@@ -546,6 +576,8 @@ def _fetch_account_details_dict(acc: AccountConfig) -> dict:
         }
     except Exception as e:
         return {"equip": f"ошибка: {e}"}
+    finally:
+        set_request_browser_profile(None)
 
 
 def _hand_cursor_widgets(root: QWidget) -> None:
@@ -815,6 +847,10 @@ class AccountCard(QFrame):
         self.lbl_sub.setText(last_msg)
         running = snap.running
 
+        self.setProperty("accountBanned", snap.account_banned)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
         def _pill(text: str, fg: str, bg: str, border: str) -> None:
             self.lbl_state.setText(text)
             self.lbl_state.setStyleSheet(
@@ -822,7 +858,13 @@ class AccountCard(QFrame):
                 f"background-color: {bg}; padding: 4px 10px; border-radius: 8px; border: 1px solid {border};"
             )
 
-        if snap.last_error:
+        if snap.account_banned:
+            _pill("БАН", "#ff9a96", "#3a1618", "#8b3030")
+            self._icon.setStyleSheet(
+                "background-color: rgba(220, 62, 62, 0.18); color: #ff6b66; "
+                "border-radius: 14px; font-size: 22px; border: 1px solid #8b2a2a;"
+            )
+        elif snap.last_error:
             _pill("СБОЙ", "#ff8a84", "#2a1818", "#5c3030")
             self._icon.setStyleSheet(
                 "background-color: rgba(255, 113, 108, 0.12); color: #ff716c; "
@@ -848,12 +890,14 @@ class AccountCard(QFrame):
         bal = snap.balance
         self.chip_ch.setText(f"$SIEGE {format_ch_amount(bal)}")
 
-        self.btn_start.setEnabled(not running)
+        self.btn_start.setEnabled(not running and not snap.account_banned)
         self.btn_stop.setEnabled(running)
 
         w = snap.wave or 0
         self._bar.setValue(min(100, (w % 100) or (50 if running else 0)))
-        if snap.last_error:
+        if snap.account_banned:
+            self._bar.setStyleSheet("QProgressBar::chunk { background-color: #d04444; }")
+        elif snap.last_error:
             self._bar.setStyleSheet("QProgressBar::chunk { background-color: #ff716c; }")
         elif running:
             self._bar.setStyleSheet("QProgressBar::chunk { background-color: #3fff8b; }")
@@ -2181,9 +2225,13 @@ class MainWindow(QMainWindow):
         head.addLayout(tit, 1)
         self.btn_acct_refresh = QPushButton("Обновить таблицу")
         self.btn_acct_refresh.setObjectName("secondary")
+        self.btn_acct_delete_banned = QPushButton("Удалить забаненные")
+        self.btn_acct_delete_banned.setObjectName("danger")
+        self.btn_acct_delete_banned.setToolTip("Удалить все аккаунты с флагом БАН (ACCOUNT_BANNED) из базы, кошельков и состояния")
         self.btn_acct_export = QPushButton("Экспорт в .txt…")
         self.btn_acct_export.setObjectName("primary")
         head.addWidget(self.btn_acct_refresh, 0, Qt.AlignmentFlag.AlignBottom)
+        head.addWidget(self.btn_acct_delete_banned, 0, Qt.AlignmentFlag.AlignBottom)
         head.addWidget(self.btn_acct_export, 0, Qt.AlignmentFlag.AlignBottom)
         layout.addLayout(head)
         self.acct_table = QTableWidget(0, 9)
@@ -2204,12 +2252,14 @@ class MainWindow(QMainWindow):
         acct_hdr.setSectionResizeMode(8, QHeaderView.ResizeMode.Fixed)
         self.acct_table.setColumnWidth(8, 340)
         self.acct_table.setWordWrap(False)
-        self.acct_table.setAlternatingRowColors(True)
+        # Цвет строк задаём в коде (в т.ч. бан), иначе QSS и alternate-background перекрывают setBackground.
+        self.acct_table.setAlternatingRowColors(False)
         self.acct_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.acct_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.acct_table.setShowGrid(True)
         layout.addWidget(self.acct_table, 1)
         self.btn_acct_refresh.clicked.connect(self._fill_accounts_manager_table)
+        self.btn_acct_delete_banned.clicked.connect(self._delete_banned_accounts_clicked)
         self.btn_acct_export.clicked.connect(self._export_accounts_clicked)
         _hand_cursor_widgets(self._page_accounts)
 
@@ -2576,10 +2626,17 @@ class MainWindow(QMainWindow):
             return
         cache_rows = self.account_cache_store.get_rows()
         wallets_by_id = self.wallet_store.get_all_wallets()
+        ban_bg = QBrush(QColor("#33191c"))
+        ban_fg = QBrush(QColor("#ffc8c4"))
+        stripe_a = QBrush(QColor("#1c1c1c"))
+        stripe_b = QBrush(QColor("#232323"))
+        fg_normal = QBrush(QColor("#eaeaea"))
         self.acct_table.setUpdatesEnabled(False)
         try:
             self.acct_table.setRowCount(len(self._accounts_list))
             for r, acc in enumerate(self._accounts_list):
+                snap_row = self.snapshots.get(acc.account_id)
+                row_banned = bool(snap_row and snap_row.account_banned)
                 rw = self._account_row_view(
                     acc, cache_rows=cache_rows, wallets_by_id=wallets_by_id
                 )
@@ -2596,12 +2653,19 @@ class MainWindow(QMainWindow):
                     "да" if rw.get("running") else "нет",
                     "",
                 ]
+                row_stripe = stripe_a if r % 2 == 0 else stripe_b
                 for c, val in enumerate(vals):
                     it = QTableWidgetItem(str(val))
                     if c == 0:
                         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     if c == 2:
                         it.setToolTip(rw["account_id"])
+                    if row_banned:
+                        it.setBackground(ban_bg)
+                        it.setForeground(ban_fg)
+                    else:
+                        it.setBackground(row_stripe)
+                        it.setForeground(fg_normal)
                     self.acct_table.setItem(r, c, it)
 
                 proxy_wrap = QWidget()
@@ -2610,7 +2674,11 @@ class MainWindow(QMainWindow):
                 ph.setSpacing(6)
                 lbl = QLabel(px_show or "—")
                 lbl.setToolTip(px or "Прокси не задан")
-                lbl.setStyleSheet("color: #d8d8d8; font-size: 12px;")
+                lbl.setStyleSheet(
+                    "color: #ffc8c4; font-size: 12px;"
+                    if row_banned
+                    else "color: #d8d8d8; font-size: 12px;"
+                )
                 btn = QPushButton("Изм.")
                 btn.setObjectName("acctProxyBtn")
                 btn.setFixedSize(44, 24)
@@ -2618,6 +2686,11 @@ class MainWindow(QMainWindow):
                 btn.clicked.connect(partial(self._change_account_proxy, acc.account_id))
                 ph.addWidget(lbl, 1, Qt.AlignmentFlag.AlignVCenter)
                 ph.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+                if row_banned:
+                    proxy_wrap.setStyleSheet("background-color: #33191c; border-radius: 6px;")
+                else:
+                    stripe_hex = "#1c1c1c" if r % 2 == 0 else "#232323"
+                    proxy_wrap.setStyleSheet(f"background-color: {stripe_hex}; border-radius: 6px;")
                 self.acct_table.setCellWidget(r, 8, proxy_wrap)
                 self.acct_table.setRowHeight(r, self.ACCT_TABLE_ROW_HEIGHT)
         finally:
@@ -2679,6 +2752,37 @@ class MainWindow(QMainWindow):
             w.account.http_proxy = new_proxy
         self._load_accounts()
 
+    def _delete_banned_accounts_clicked(self) -> None:
+        banned_ids = [aid for aid, snap in self.snapshots.items() if snap.account_banned]
+        if not banned_ids:
+            QMessageBox.information(self, "Аккаунты", "Забаненных аккаунтов нет.")
+            return
+        n = len(banned_ids)
+        if (
+            QMessageBox.question(
+                self,
+                "Удаление",
+                f"Удалить {n} забаненн(ых) аккаунт(ов)? Будут удалены данные аккаунта, кошелёк, состояние и закреплённый за ним прокси из пула. Отменить это нельзя.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        for aid in banned_ids:
+            acc = self._find_account(aid)
+            proxy_norm = normalize_proxy_input(acc.http_proxy) if acc else None
+            self._stop_account(aid)
+            self.workers.pop(aid, None)
+            self.account_store.delete_account(aid)
+            self.wallet_store.remove_wallet(aid)
+            self.state_store.delete_snapshot(aid)
+            self.snapshots.pop(aid, None)
+            self.details_cache.pop(aid, None)
+            if proxy_norm:
+                self.proxy_pool.remove_by_normalized(normalize_proxy_input, proxy_norm)
+        self._load_accounts()
+
     def _export_accounts_clicked(self) -> None:
         cache_rows = self.account_cache_store.get_rows()
         wallets_by_id = self.wallet_store.get_all_wallets()
@@ -2719,6 +2823,8 @@ class MainWindow(QMainWindow):
         elif ev.event_type == "error":
             snap.last_error = str(ev.payload.get("message"))
             snap.running = False
+            if ev.payload.get("account_banned"):
+                snap.account_banned = True
             persist = True
             refresh = True
         elif ev.event_type == "log":
@@ -2792,7 +2898,10 @@ class MainWindow(QMainWindow):
             results: dict = {}
             try:
                 for acc in accs:
-                    results[acc.account_id] = _fetch_account_details_dict(acc)
+                    sp = self.snapshots.get(acc.account_id)
+                    results[acc.account_id] = _fetch_account_details_dict(
+                        acc, account_banned=bool(sp and sp.account_banned)
+                    )
             finally:
                 self._sig_detail_poll.emit(results)
 
@@ -2825,7 +2934,13 @@ class MainWindow(QMainWindow):
             return
 
         def run() -> None:
-            self._sig_detail_manual.emit({acc.account_id: _fetch_account_details_dict(acc)})
+            sp = self.snapshots.get(acc.account_id)
+            results = {
+                acc.account_id: _fetch_account_details_dict(
+                    acc, account_banned=bool(sp and sp.account_banned)
+                )
+            }
+            self._sig_detail_manual.emit(results)
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -2835,12 +2950,21 @@ class MainWindow(QMainWindow):
         acc = self._find_account(account_id)
         if not acc:
             return
+        snap_pre = self.snapshots.get(account_id) or BotSnapshot(account_id=account_id)
+        if snap_pre.account_banned:
+            QMessageBox.warning(
+                self,
+                "Аккаунт",
+                "Аккаунт заблокирован на сервере (ACCOUNT_BANNED). Запуск бота с него отключён.",
+            )
+            return
         acc_run = replace(acc, cheater_wave_mode=self.app_settings.cheater_wave_mode)
         worker = BotWorker(
             project_root=self.root,
             account=acc_run,
             on_event=lambda ev: self.bridge.event_signal.emit(ev),
             on_log=lambda level, msg: self.bridge.log_signal.emit(level, f"[{acc.name}] {msg}"),
+            snapshot_seed=snap_pre,
         )
         self.workers[account_id] = worker
         worker.start()
@@ -2983,6 +3107,7 @@ class MainWindow(QMainWindow):
                     bearer_token=token,
                     client_version=APP_CLIENT_VERSION,
                     http_proxy=proxy,
+                    browser_profile=generate_browser_profile(),
                 )
                 apply_app_settings(account, self.app_settings)
                 self.account_store.upsert_account(account)

@@ -9,6 +9,96 @@ import urllib.request
 BASE_URL = "https://api.solsiege.com"
 
 _tls = threading.local()
+_tls_browser = threading.local()
+
+# Отпечаток до выставления профиля аккаунта (регистрация/одиночный вызов)
+_LEGACY_PROOF_INNER_BASE = {
+    "sc": "1920x1080x24",
+    "lang": "ru",
+    "plt": "Win32",
+    "mem": 8,
+    "hw": 16,
+    "cv": "oega4d",
+    "touch": False,
+    "gl": (
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Ti (0x00002803) "
+        "Direct3D11 vs_5_0 ps_5_0, D3D11)"
+    ),
+    "tz": -180,
+    "vis": "visible",
+}
+
+
+def set_request_browser_profile(profile: dict | None) -> None:
+    """Профиль из AccountConfig.browser_profile; None — сброс (заголовки без UA-маскировки)."""
+    if profile:
+        _tls_browser.profile = profile
+    else:
+        if hasattr(_tls_browser, "profile"):
+            delattr(_tls_browser, "profile")
+
+
+# Если профиль потока не выставлен — не светим Python-urllib (общий вид «как браузер»).
+_FALLBACK_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://solsiege.com/",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+    "Sec-Fetch-Dest": "empty",
+}
+
+
+def _browser_header_overlay() -> dict[str, str]:
+    p = getattr(_tls_browser, "profile", None)
+    if not p or not isinstance(p, dict):
+        return dict(_FALLBACK_BROWSER_HEADERS)
+    h: dict[str, str] = {}
+    ua = p.get("user_agent")
+    if ua:
+        h["User-Agent"] = str(ua)
+    if p.get("accept_language"):
+        h["Accept-Language"] = str(p["accept_language"])
+    if p.get("sec_ch_ua"):
+        h["sec-ch-ua"] = str(p["sec_ch_ua"])
+    if p.get("sec_ch_ua_mobile") is not None:
+        h["sec-ch-ua-mobile"] = str(p["sec_ch_ua_mobile"])
+    if p.get("sec_ch_ua_platform"):
+        h["sec-ch-ua-platform"] = str(p["sec_ch_ua_platform"])
+    full_list = p.get("sec_ch_ua_full_version_list")
+    if full_list:
+        h["Sec-CH-UA-Full-Version-List"] = str(full_list)
+    h["Accept"] = "*/*"
+    h["Referer"] = "https://solsiege.com/"
+    h["Sec-Fetch-Mode"] = "cors"
+    h["Sec-Fetch-Site"] = "cross-site"
+    h["Sec-Fetch-Dest"] = "empty"
+    if "User-Agent" not in h:
+        h["User-Agent"] = _FALLBACK_BROWSER_HEADERS["User-Agent"]
+    if "Accept-Language" not in h:
+        h["Accept-Language"] = _FALLBACK_BROWSER_HEADERS["Accept-Language"]
+    return h
+
+
+def _build_api_headers(
+    bearer_token: str | None,
+    client_version: str,
+    with_json_body: bool,
+) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "X-Client-Version": client_version,
+        "Origin": "https://solsiege.com",
+    }
+    if bearer_token:
+        headers["Authorization"] = f"Bearer {bearer_token}"
+    headers.update(_browser_header_overlay())
+    if with_json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
 
 
 def _parse_proxy_line(line: str | None) -> tuple[str | None, str | None]:
@@ -126,15 +216,10 @@ class SiegeApiError(Exception):
 
 def _request(bearer_token, client_version, method, path, body=None):
     url = BASE_URL + path
-    headers = {
-        "Authorization": f"Bearer {bearer_token}",
-        "X-Client-Version": client_version,
-        "Origin": "https://solsiege.com",
-    }
     data = None
     if body is not None:
-        headers["Content-Type"] = "application/json"
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = _build_api_headers(bearer_token, client_version, body is not None)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with _urlopen_with_tunnel_502_retry(req, timeout=60) as resp:
@@ -152,16 +237,10 @@ def _request(bearer_token, client_version, method, path, body=None):
 
 def _request_public(client_version, method, path, body=None, bearer_token: str | None = None):
     url = BASE_URL + path
-    headers = {
-        "X-Client-Version": client_version,
-        "Origin": "https://solsiege.com",
-    }
-    if bearer_token:
-        headers["Authorization"] = f"Bearer {bearer_token}"
     data = None
     if body is not None:
-        headers["Content-Type"] = "application/json"
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = _build_api_headers(bearer_token, client_version, body is not None)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with _urlopen_with_tunnel_502_retry(req, timeout=60) as resp:
@@ -178,22 +257,14 @@ def _request_public(client_version, method, path, body=None, bearer_token: str |
 
 
 def client_proof():
-    e = {
-        "ts": int(time.time() * 1000),
-        "sc": "1920x1080x24",
-        "lang": "ru",
-        "plt": "Win32",
-        "mem": 8,
-        "hw": 16,
-        "cv": "oega4d",
-        "touch": False,
-        "gl": (
-            "ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Ti (0x00002803) "
-            "Direct3D11 vs_5_0 ps_5_0, D3D11)"
-        ),
-        "tz": -180,
-        "vis": "visible",
-    }
+    p = getattr(_tls_browser, "profile", None)
+    inner_src = None
+    if p and isinstance(p, dict) and isinstance(p.get("proof_inner"), dict):
+        inner_src = p["proof_inner"]
+    if inner_src is None:
+        inner_src = _LEGACY_PROOF_INNER_BASE
+    e = dict(inner_src)
+    e["ts"] = int(time.time() * 1000)
     return base64.b64encode(json.dumps(e, separators=(",", ":")).encode()).decode()
 
 
@@ -278,11 +349,7 @@ def post_captcha_solve(bearer_token, client_version, answer: str):
 def post_wave_fail(bearer_token, client_version):
     """Намеренный проигрыш текущей волны (как в клиенте при поражении). Тело пустое."""
     url = BASE_URL + "/wave/fail"
-    headers = {
-        "Authorization": f"Bearer {bearer_token}",
-        "X-Client-Version": client_version,
-        "Origin": "https://solsiege.com",
-    }
+    headers = _build_api_headers(bearer_token, client_version, False)
     req = urllib.request.Request(url, data=b"", method="POST", headers=headers)
     try:
         with _urlopen_with_tunnel_502_retry(req, timeout=60) as resp:

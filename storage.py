@@ -10,6 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from browser_profile import (
+    generate_browser_profile,
+    is_complete_browser_profile,
+    upgrade_browser_profile_headers,
+)
 from models import AccountConfig, AppSettings, BotSnapshot
 
 
@@ -84,9 +89,19 @@ class AccountStore:
         self.path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def list_accounts(self) -> list[AccountConfig]:
-        raw = self._read().get("accounts", [])
+        data = self._read()
+        raw = data.get("accounts", [])
+        mutated = False
         out: list[AccountConfig] = []
         for row in raw:
+            bp = row.get("browser_profile")
+            if not is_complete_browser_profile(bp):
+                row["browser_profile"] = generate_browser_profile()
+                mutated = True
+            elif isinstance(row.get("browser_profile"), dict) and upgrade_browser_profile_headers(
+                row["browser_profile"]
+            ):
+                mutated = True
             token_enc = row.get("bearer_token_enc")
             token = self.sec.decrypt_text(token_enc) if token_enc else ""
             out.append(
@@ -107,8 +122,12 @@ class AccountStore:
                     stealth_random_fail_chance=float(row.get("stealth_random_fail_chance") or 0),
                     sleep_min_seconds=float(row.get("sleep_min_seconds", 8.0)),
                     sleep_max_seconds=float(row.get("sleep_max_seconds", 14.0)),
+                    browser_profile=row.get("browser_profile"),
                 )
             )
+        if mutated:
+            data["accounts"] = raw
+            self._write(data)
         return out
 
     def upsert_account(self, account: AccountConfig) -> None:
@@ -185,6 +204,12 @@ class WalletStore:
                 "private_key_b58": pk,
             }
         return out
+
+    def remove_wallet(self, account_id: str) -> None:
+        db = self._read()
+        if account_id in db:
+            del db[account_id]
+            self._write(db)
 
 
 class ProxyPoolStore:
@@ -304,6 +329,25 @@ class ProxyPoolStore:
             if 0 <= i < len(xs):
                 xs.pop(i)
         self._write({"proxies": xs})
+
+    def remove_by_normalized(
+        self, normalize_fn: Callable[[str], str | None], target_norm: str | None
+    ) -> int:
+        """Удаляет из пула строки, совпадающие с target_norm по normalize_fn. Возвращает число удалённых."""
+        if not target_norm:
+            return 0
+        xs = self.list_all()
+        out: list[str] = []
+        removed = 0
+        for line in xs:
+            n = normalize_fn(line)
+            if n == target_norm:
+                removed += 1
+                continue
+            out.append(line)
+        if removed:
+            self._write({"proxies": out})
+        return removed
 
     def clear(self) -> None:
         self._write({"proxies": []})
@@ -445,6 +489,11 @@ class StateStore:
                 snap.updated_at = datetime.utcnow()
         snap.running = False
         return snap
+
+    def delete_snapshot(self, account_id: str) -> None:
+        p = self.path / f"{account_id}.json"
+        if p.is_file():
+            p.unlink()
 
 
 def ensure_project_data_initialized(root: Path) -> None:

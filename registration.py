@@ -6,6 +6,7 @@ import random
 import re
 from dataclasses import dataclass
 
+from browser_profile import generate_browser_profile
 from models import AccountConfig
 from siege_client import (
     get_auth_me,
@@ -14,6 +15,7 @@ from siege_client import (
     post_auth_login,
     post_character_create,
     set_http_proxy,
+    set_request_browser_profile,
 )
 
 _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -108,51 +110,54 @@ def register_new_account_api_only(
     nickname: str | None = None,
     character_class: str = "mage",
 ) -> RegistrationResult:
-    # Use per-account proxy before all calls
     set_http_proxy(proxy)
+    profile = generate_browser_profile()
+    set_request_browser_profile(profile)
+    try:
+        seed = os.urandom(32)
+        wallet_address, _ = _sign_message_ed25519(seed, "bootstrap")
 
-    # Generate wallet seed and Solana-compatible pubkey/signature
-    seed = os.urandom(32)
-    wallet_address, _ = _sign_message_ed25519(seed, "bootstrap")
+        nonce_payload = get_auth_nonce(client_version, wallet_address)
+        msg = nonce_payload.get("message", "")
+        if not msg:
+            raise RuntimeError(f"auth/nonce не вернул message: {nonce_payload}")
 
-    nonce_payload = get_auth_nonce(client_version, wallet_address)
-    msg = nonce_payload.get("message", "")
-    if not msg:
-        raise RuntimeError(f"auth/nonce не вернул message: {nonce_payload}")
+        wallet_address, signature = _sign_message_ed25519(seed, msg)
 
-    wallet_address, signature = _sign_message_ed25519(seed, msg)
+        login = post_auth_login(client_version, wallet_address, signature, referral_code=None)
+        access_token = login.get("access_token")
+        if not access_token:
+            raise RuntimeError(f"auth/login не вернул access_token: {login}")
 
-    login = post_auth_login(client_version, wallet_address, signature, referral_code=None)
-    access_token = login.get("access_token")
-    if not access_token:
-        raise RuntimeError(f"auth/login не вернул access_token: {login}")
+        me = get_auth_me(access_token, client_version)
+        player_id = me.get("player_id")
 
-    me = get_auth_me(access_token, client_version)
-    player_id = me.get("player_id")
+        classes = get_character_classes(access_token, client_version)
+        class_names = [c.get("name") for c in classes.get("classes", []) if isinstance(c, dict)]
+        selected_class = (
+            character_class if character_class in class_names else (class_names[0] if class_names else "mage")
+        )
+        nick = nickname or random_nickname()
+        nick = re.sub(r"[^A-Za-z0-9_]", "", nick)[:16] or random_nickname()
 
-    classes = get_character_classes(access_token, client_version)
-    class_names = [c.get("name") for c in classes.get("classes", []) if isinstance(c, dict)]
-    selected_class = character_class if character_class in class_names else (class_names[0] if class_names else "mage")
-    nick = nickname or random_nickname()
-    # server-side name validation compatibility
-    nick = re.sub(r"[^A-Za-z0-9_]", "", nick)[:16] or random_nickname()
+        ch = post_character_create(access_token, client_version, selected_class, nick)
+        character_id = (ch.get("character") or {}).get("id")
 
-    ch = post_character_create(access_token, client_version, selected_class, nick)
-    character_id = (ch.get("character") or {}).get("id")
-
-    account = AccountConfig(
-        account_id=player_id or hashlib.sha1(wallet_address.encode("utf-8")).hexdigest()[:10],
-        name=nick,
-        bearer_token=access_token,
-        client_version=client_version,
-        http_proxy=proxy,
-    )
-    # Solana tools usually store 64-byte secret key; keep seed b58 for deterministic restore.
-    private_key_b58 = b58encode(seed)
-    return RegistrationResult(
-        account=account,
-        wallet_address=wallet_address,
-        private_key_b58=private_key_b58,
-        player_id=player_id,
-        character_id=character_id,
-    )
+        account = AccountConfig(
+            account_id=player_id or hashlib.sha1(wallet_address.encode("utf-8")).hexdigest()[:10],
+            name=nick,
+            bearer_token=access_token,
+            client_version=client_version,
+            http_proxy=proxy,
+            browser_profile=profile,
+        )
+        private_key_b58 = b58encode(seed)
+        return RegistrationResult(
+            account=account,
+            wallet_address=wallet_address,
+            private_key_b58=private_key_b58,
+            player_id=player_id,
+            character_id=character_id,
+        )
+    finally:
+        set_request_browser_profile(None)

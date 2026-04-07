@@ -21,3 +21,6 @@ captcha_history.jsonl
 # IDE
 .idea/
 .vscode/
+
+# Локальное зеркало для пуша на GitHub (пересобирается отдельно)
+github/

@@ -23,6 +23,7 @@ class AccountConfig:
     stealth_random_fail_chance: float = 0.0
     sleep_min_seconds: float = 8.0
     sleep_max_seconds: float = 14.0
+    browser_profile: dict[str, Any] | None = None
 
 
 @dataclass
@@ -39,6 +40,7 @@ class BotSnapshot:
     bp_xp: int | None = None
     last_error: str | None = None
     last_message: str | None = None
+    account_banned: bool = False
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
 

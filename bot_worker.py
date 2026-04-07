@@ -5,10 +5,12 @@ import json
 import random
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from browser_profile import generate_browser_profile, is_complete_browser_profile
 from captcha_logger import log_captcha_event
 from models import AccountConfig, BotEvent, BotSnapshot
 from siege_client import (
@@ -32,6 +34,7 @@ from siege_client import (
     post_wave_fail,
     post_wave_teleport,
     set_http_proxy,
+    set_request_browser_profile,
 )
 from twocaptcha_solver import (
     try_local_color_captcha,
@@ -40,6 +43,10 @@ from twocaptcha_solver import (
     try_local_word_captcha,
 )
 from wave_human_sim import simulate_boss_wave_win
+
+
+class AccountBannedError(Exception):
+    """Сервер вернул ACCOUNT_BANNED — дальнейшие запросы с этого аккаунта бессмысленны."""
 
 
 def _fmt_ch_amount(v) -> str:
@@ -60,6 +67,7 @@ class BotWorker:
         account: AccountConfig,
         on_event: Callable[[BotEvent], None] | None = None,
         on_log: Callable[[str, str], None] | None = None,
+        snapshot_seed: BotSnapshot | None = None,
     ) -> None:
         self.project_root = project_root
         self.account = account
@@ -67,7 +75,14 @@ class BotWorker:
         self.on_log = on_log
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._snapshot = BotSnapshot(account_id=account.account_id, running=False)
+        if snapshot_seed is not None:
+            self._snapshot = replace(
+                snapshot_seed,
+                account_id=account.account_id,
+                running=False,
+            )
+        else:
+            self._snapshot = BotSnapshot(account_id=account.account_id, running=False)
 
     @property
     def snapshot(self) -> BotSnapshot:
@@ -103,6 +118,30 @@ class BotWorker:
         self._snapshot.last_error = message
         self._snapshot.updated_at = datetime.utcnow()
         self._emit("error", message=message)
+
+    def _set_account_banned(self, message: str) -> None:
+        self._snapshot.account_banned = True
+        self._snapshot.last_error = message
+        self._snapshot.updated_at = datetime.utcnow()
+        self._log("error", message)
+        self._emit("error", message=message, account_banned=True)
+
+    @staticmethod
+    def _ban_detail_text(e: SiegeApiError) -> str:
+        d = e.detail
+        if isinstance(d, str):
+            return d
+        if isinstance(d, list):
+            return " ".join(str(x) for x in d)
+        if isinstance(d, dict):
+            return json.dumps(d, ensure_ascii=False)
+        return str(d)
+
+    @staticmethod
+    def _is_account_banned(e: SiegeApiError) -> bool:
+        if e.status != 403:
+            return False
+        return "ACCOUNT_BANNED" in BotWorker._ban_detail_text(e)
 
     def _jwt_exp_unix(self, bearer_token: str):
         try:
@@ -141,6 +180,10 @@ class BotWorker:
     def _safe_err(self, e: SiegeApiError, name: str) -> None:
         if e.status == 401:
             raise RuntimeError("HTTP 401 — сессия недействительна.")
+        if self._is_account_banned(e):
+            raise AccountBannedError(
+                "HTTP 403 — ACCOUNT_BANNED (аккаунт заблокирован, запросы с него прекращены)."
+            ) from None
         self._log("warning", f"[!] {name}: HTTP {e.status} — {e.detail}")
 
     @staticmethod
@@ -355,7 +398,10 @@ class BotWorker:
                     solver_src = "local_word"
             if answer is None:
                 raise RuntimeError("Нет локального решения для капчи.")
-            cap_res = post_captcha_solve(token, version, answer)
+            try:
+                cap_res = post_captcha_solve(token, version, answer)
+            except SiegeApiError as e:
+                self._safe_err(e, "captcha/solve")
             log_captcha_event(self.project_root, self.account.captcha_log_file, {
                 "event": "captcha_solve_attempt",
                 "attempt": cap,
@@ -369,9 +415,15 @@ class BotWorker:
                 "message": cap_res.get("message"),
             })
             if not cap_res.get("correct"):
-                wave = get_wave_current(token, version)
+                try:
+                    wave = get_wave_current(token, version)
+                except SiegeApiError as e:
+                    self._safe_err(e, "wave/current")
                 continue
-            wave = get_wave_current(token, version)
+            try:
+                wave = get_wave_current(token, version)
+            except SiegeApiError as e:
+                self._safe_err(e, "wave/current")
         return wave
 
     def _run(self) -> None:
@@ -385,8 +437,13 @@ class BotWorker:
         try:
             self._check_token_not_expired(token)
             set_http_proxy(self.account.http_proxy)
+            prof = self.account.browser_profile
+            if not is_complete_browser_profile(prof):
+                prof = generate_browser_profile()
+            set_request_browser_profile(prof)
         except Exception as e:
             self._set_error(str(e))
+            set_request_browser_profile(None)
             return
 
         self._snapshot.running = True
@@ -406,6 +463,9 @@ class BotWorker:
 
                 try:
                     wave = self._solve_captcha_loop(token, version, wave)
+                except AccountBannedError as e:
+                    self._set_account_banned(str(e))
+                    break
                 except Exception as e:
                     self._set_error(str(e))
                     break
@@ -523,11 +583,14 @@ class BotWorker:
                     total_earned=self._snapshot.total_earned,
                 )
                 time.sleep(self._next_sleep())
+        except AccountBannedError as e:
+            self._set_account_banned(str(e))
         except RuntimeError as e:
             self._set_error(str(e))
         except Exception as e:
             self._set_error(f"Необработанная ошибка: {e}")
         finally:
+            set_request_browser_profile(None)
             self._snapshot.running = False
             self._snapshot.updated_at = datetime.utcnow()
             self._emit("stopped")
