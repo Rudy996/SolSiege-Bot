@@ -1,0 +1,15 @@
+{
+  "bearer_token": "",
+  "http_proxy": "",
+  "client_version": "mngmv2a9",
+  "captcha_log_file": "captcha_history.jsonl",
+  "stealth_teleport_when_wave_ge": null,
+  "stealth_teleport_to_wave": null,
+  "stealth_random_fail_chance": 0,
+  "auto_open_chests": true,
+  "auto_equip": true,
+  "auto_upgrade_stats": true,
+  "auto_claim_bp": true,
+  "sleep_min_seconds": 8.0,
+  "sleep_max_seconds": 14.0
+}

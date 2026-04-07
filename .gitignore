@@ -1,0 +1,23 @@
+# Локальные данные и секреты
+data/
+config.json
+.secret.key
+.env
+.env.*
+
+# Кэш и окружение
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+
+# Логи и артефакты отладки
+*.jsonl
+*.har
+captcha_history.jsonl
+
+# IDE
+.idea/
+.vscode/
